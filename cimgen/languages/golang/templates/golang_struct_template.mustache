@@ -1,0 +1,27 @@
+/*
+Generated from the CGMES files via cimgen: https://github.com/sogno-platform/cimgen
+*/
+
+package cgmes2
+
+type {{class_name}} struct {
+    {{sub_class_of}}
+
+    /*
+    {{{wrapped_class_comment}}}
+    
+    {{#attributes}}
+    {{label}}: {{{wrapped_comment}}}
+    {{/attributes}}
+    */
+
+    {{#attributes}}
+ 
+    {{label}} *{{attribute_class}} {{#setXML}}{{.}}{{/setXML}}
+ 
+    {{/attributes}}
+ 
+    {{^attributes}} 
+    /* No attributes defined for this class. */
+    {{/attributes}}
+}
