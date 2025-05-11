@@ -4,6 +4,7 @@ import warnings
 from pathlib import Path
 from time import time
 from types import ModuleType
+import json
 
 import xmltodict
 from bs4 import BeautifulSoup
@@ -648,6 +649,8 @@ def cim_generate(directory: Path, output_path: str, version: str, lang_pack: Mod
         parsed = _parse_rdf(parse_result, version)
         profiles_array.append(parsed)
 
+    print(json.dumps(parse_result, indent=4))
+    
     # merge multiple profile definitions into one profile
     profiles_dict = _merge_profiles(profiles_array)
 
