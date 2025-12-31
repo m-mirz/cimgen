@@ -1,8 +1,8 @@
 package cimgen
 
 import (
-	"bytes"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"os"
@@ -192,26 +192,26 @@ func (cimSpec *CIMSpecification) ImportCIMSchemaFiles(schemaFiles string) error 
 			return fmt.Errorf("failed to read schema file %s: %w", entry, err)
 		}
 
-		resultMap, err := DecodeToMap(bytes.NewReader(b))
+		var rdf RDF
+		err = xml.Unmarshal(b, &rdf)
 		if err != nil {
 			return fmt.Errorf("failed to decode schema file %s: %w", entry, err)
 		}
 
-		cimSpec.addRDFMap(resultMap)
+		cimSpec.addRDF(&rdf)
 	}
-
 	cimSpec.postprocess()
 	return nil
 }
 
 // addRDFMap adds the CIM types, enums, and ontology from the input map to the CIMSpecification.
-func (cimSpec *CIMSpecification) addRDFMap(inputMap map[string]interface{}) {
-	cimTypes, cimEnums, cimOntology, namespaces, cimDatatypes, cimPrimitives := processRDFMap(inputMap)
+func (cimSpec *CIMSpecification) addRDF(rdf *RDF) {
+	cimTypes, cimEnums, cimOntology, namespaces, cimDatatypes, cimPrimitives := processRDF(rdf)
 	cimSpec.Types = mergeCimTypes(cimSpec.Types, cimTypes)
 	cimSpec.Enums = mergeCimEnums(cimSpec.Enums, cimEnums)
 	cimSpec.CIMDatatypes = mergeCIMDatatypes(cimSpec.CIMDatatypes, cimDatatypes)
 	cimSpec.PrimitiveTypes = mergePrimitives(cimSpec.PrimitiveTypes, cimPrimitives)
-	cimSpec.Ontologies[cimOntology.Keyword] = &cimOntology
+	cimSpec.Ontologies[cimOntology.Keyword] = cimOntology
 	cimSpec.SpecificationNamespaces = mergeNamespaces(cimSpec.SpecificationNamespaces, namespaces)
 }
 
@@ -263,45 +263,61 @@ func (cimSpec *CIMSpecification) printSpecification(w io.Writer) error {
 }
 
 // processRDFMap processes the RDF map and extracts CIM types, enums, and ontology.
-func processRDFMap(inputMap map[string]interface{}) (map[string]*CIMType, map[string]*CIMEnum, CIMOntology, map[string]string, map[string]*CIMDatatype, map[string]*CIMPrimitive) {
-	rdfMap := inputMap["rdf:RDF"].(map[string]interface{})
-	namespaces := processNamespaces(rdfMap)
+func processRDF(rdf *RDF) (map[string]*CIMType, map[string]*CIMEnum, *CIMOntology, map[string]string, map[string]*CIMDatatype, map[string]*CIMPrimitive) {
+	namespaces := processNamespaces(rdf)
 
-	descriptions := rdfMap["rdf:Description"].([]map[string]interface{})
+	descriptions := rdf.Descriptions
 	cimTypes := make(map[string]*CIMType, 0)
 	cimDatatypes := make(map[string]*CIMDatatype, 0)
 	cimPrimitives := make(map[string]*CIMPrimitive, 0)
 	cimEnums := make(map[string]*CIMEnum, 0)
 	cimEnumValues := make([]*CIMEnumValue, 0)
 	cimAttributes := make([]*CIMAttribute, 0)
-	var cimOntology CIMOntology
+	var cimOntology *CIMOntology
 
 	for _, v := range descriptions {
 		objType := extractResource(v, "rdf:type")
 
 		if strings.Contains(objType, "http://www.w3.org/2000/01/rdf-schema#Class") {
 			if extractStringOrResource(v["cims:stereotype"]) == "http://iec.ch/TC57/NonStandard/UML#enumeration" {
+		if strings.Contains(objType, "Class") {
+			stereotype := extractStereotype(v)
+			if stereotype == "http://iec.ch/TC57/NonStandard/UML#enumeration" || stereotype == "enumeration" {
 				e := processEnum(v)
 				e.Origin = cimOntology.Keyword
 				e.Origins = []string{cimOntology.Keyword}
+				if cimOntology != nil {
+					e.Origin = cimOntology.Keyword
+					e.Origins = []string{cimOntology.Keyword}
+				}
 				cimEnums[e.Id] = &e
 			} else if extractStringOrResource(v["cims:stereotype"]) == "CIMDatatype" {
 				//TODO || extractStringOrResource(v["cims:stereotype"]) == "Compound" {
+			} else if stereotype == "CIMDatatype" || stereotype == "Compound" {
 				e := processCIMDatatypes(v)
 				cimDatatypes[e.Id] = &e
 			} else if extractStringOrResource(v["cims:stereotype"]) == "Primitive" {
+			} else if stereotype == "Primitive" {
 				e := processPrimitives(v)
 				cimPrimitives[e.Id] = &e
 			} else {
 				e := processClass(v)
 				e.Origin = cimOntology.Keyword
 				e.Origins = []string{cimOntology.Keyword}
+				if cimOntology != nil {
+					e.Origin = cimOntology.Keyword
+					e.Origins = []string{cimOntology.Keyword}
+				}
 				cimTypes[e.Id] = &e
 			}
 		} else if strings.Contains(objType, "http://www.w3.org/1999/02/22-rdf-syntax-ns#Property") {
 			cimAttribute := processProperty(v)
 			cimAttribute.Origin = cimOntology.Keyword
 			cimAttribute.Origins = []string{cimOntology.Keyword}
+			if cimOntology != nil {
+				cimAttribute.Origin = cimOntology.Keyword
+				cimAttribute.Origins = []string{cimOntology.Keyword}
+			}
 			cimAttributes = append(cimAttributes, &cimAttribute)
 		} else if strings.Contains(objType, "http://iec.ch/TC57/1999/rdf-schema-extensions-19990926#ClassCategory") {
 
@@ -321,89 +337,86 @@ func processRDFMap(inputMap map[string]interface{}) (map[string]*CIMType, map[st
 }
 
 // processNamespaces collects all namespaces declared in the specification
-func processNamespaces(rdfMap map[string]interface{}) map[string]string {
+func processNamespaces(rdf *RDF) map[string]string {
 	namespaces := make(map[string]string)
-	// iterate over rdfMap and process each element that is @xml or @xmlns
-	for k, v := range rdfMap {
-		if strings.HasPrefix(k, "@xmlns:") {
-			// add # at the end of the namespace URI if not present
-			ns := v.(string)
+	for _, attr := range rdf.Descriptions[0].Namespaces {
+		if strings.HasPrefix(attr.Name.Local, "xmlns:") {
+			ns := attr.Value
 			if !strings.HasSuffix(ns, "#") {
 				ns += "#"
 			}
-			namespaces[strings.TrimPrefix(k, "@xmlns:")] = ns
+			namespaces[strings.TrimPrefix(attr.Name.Local, "xmlns:")] = ns
 		}
-		if strings.HasPrefix(k, "@xml:") {
-			// add # at the end of the namespace URI if not present
-			ns := v.(string)
+		if strings.HasPrefix(attr.Name.Local, "xml:") {
+			ns := attr.Value
 			if !strings.HasSuffix(ns, "#") {
 				ns += "#"
 			}
-			namespaces[strings.TrimPrefix(k, "@xml:")] = ns
+			namespaces[strings.TrimPrefix(attr.Name.Local, "xml:")] = ns
 		}
 	}
 	return namespaces
 }
 
 // processClass processes a map representing a CIM class and returns a CIMType struct.
-func processClass(classMap map[string]interface{}) CIMType {
+func processClass(desc Description) CIMType {
 	return CIMType{
-		Id:            extractURIEnd(extractValue(classMap, "@rdf:about")),
-		Label:         extractText(classMap, "rdfs:label"),
-		SuperType:     extractURIEnd(extractResource(classMap, "rdfs:subClassOf")),
-		Comment:       cleanText(extractText(classMap, "rdfs:comment")),
-		Namespace:     extractURIPath(extractValue(classMap, "@rdf:about")),
-		CIMStereotype: extractURIEnd(extractStringOrResource(classMap["cims:stereotype"])),
-		RDFType:       extractURIEnd(extractResource(classMap, "rdf:type")),
-		CIMCategories: []string{extractURIEnd(extractResource(classMap, "cims:belongsToCategory"))},
+		Id:            extractURIEnd(desc.About),
+		Label:         extractText(desc, "rdfs:label"),
+		SuperType:     extractURIEnd(extractResource(desc, "rdfs:subClassOf")),
+		Comment:       cleanText(extractText(desc, "rdfs:comment")),
+		Namespace:     extractURIPath(desc.About),
+		CIMStereotype: extractURIEnd(extractStereotype(desc)),
+		RDFType:       extractURIEnd(extractResource(desc, "rdf:type")),
+		CIMCategories: []string{extractURIEnd(extractResource(desc, "cims:belongsToCategory"))},
 		Attributes:    make([]*CIMAttribute, 0),
 	}
 }
 
 // processPrimitives processes a map representing a CIM class and returns a CIMPrimitive struct.
-func processPrimitives(classMap map[string]interface{}) CIMPrimitive {
+func processPrimitives(desc Description) CIMPrimitive {
 	return CIMPrimitive{
-		Id:            extractURIEnd(extractValue(classMap, "@rdf:about")),
-		Label:         extractText(classMap, "rdfs:label"),
-		Comment:       cleanText(extractText(classMap, "rdfs:comment")),
-		Namespace:     extractURIPath(extractValue(classMap, "@rdf:about")),
-		CIMStereotype: extractURIEnd(extractStringOrResource(classMap["cims:stereotype"])),
-		RDFType:       extractURIEnd(extractResource(classMap, "rdf:type")),
+		Id:            extractURIEnd(desc.About),
+		Label:         extractText(desc, "rdfs:label"),
+		Comment:       cleanText(extractText(desc, "rdfs:comment")),
+		Namespace:     extractURIPath(desc.About),
+		CIMStereotype: extractURIEnd(extractStereotype(desc)),
+		RDFType:       extractURIEnd(extractResource(desc, "rdf:type")),
 	}
 }
 
 // processCIMDatatypes processes a map representing a CIM class and returns a CIMDatatypes struct.
-func processCIMDatatypes(classMap map[string]interface{}) CIMDatatype {
+func processCIMDatatypes(desc Description) CIMDatatype {
 	return CIMDatatype{
-		Id:            extractURIEnd(extractValue(classMap, "@rdf:about")),
-		Label:         extractText(classMap, "rdfs:label"),
-		Comment:       cleanText(extractText(classMap, "rdfs:comment")),
-		Namespace:     extractURIPath(extractValue(classMap, "@rdf:about")),
-		CIMStereotype: extractURIEnd(extractStringOrResource(classMap["cims:stereotype"])),
-		RDFType:       extractURIEnd(extractResource(classMap, "rdf:type")),
-		CIMCategory:   extractURIEnd(extractResource(classMap, "cims:belongsToCategory")),
+		Id:            extractURIEnd(desc.About),
+		Label:         extractText(desc, "rdfs:label"),
+		Comment:       cleanText(extractText(desc, "rdfs:comment")),
+		Namespace:     extractURIPath(desc.About),
+		CIMStereotype: extractURIEnd(extractStereotype(desc)),
+		RDFType:       extractURIEnd(extractResource(desc, "rdf:type")),
+		CIMCategory:   extractURIEnd(extractResource(desc, "cims:belongsToCategory")),
 	}
 }
 
 // processProperty processes a map representing a CIM property and returns a CIMAttribute struct.
-func processProperty(classMap map[string]interface{}) CIMAttribute {
-	associationUsed := strings.ToLower(extractStringOrResource(classMap["cims:AssociationUsed"]))
+func processProperty(desc Description) CIMAttribute {
+	associationUsed := strings.ToLower(extractText(desc, "cims:AssociationUsed"))
 	return CIMAttribute{
-		Id:                 extractURIEnd(extractValue(classMap, "@rdf:about")),
-		Namespace:          extractURIPath(extractValue(classMap, "@rdf:about")),
-		Label:              extractText(classMap, "rdfs:label"),
-		Comment:            cleanText(extractText(classMap, "rdfs:comment")),
-		CIMStereotype:      extractURIEnd(extractStringOrResource(classMap["cims:stereotype"])),
-		RDFDomain:          extractURIEnd(extractResource(classMap, "rdfs:domain")),
-		CIMDataType:        extractURIEnd(extractResource(classMap, "cims:dataType")),
-		RDFRange:           extractURIEnd(extractResource(classMap, "rdfs:range")),
-		RDFType:            extractURIEnd(extractResource(classMap, "rdf:type")),
+		Id:                 extractURIEnd(desc.About),
+		Namespace:          extractURIPath(desc.About),
+		Label:              extractText(desc, "rdfs:label"),
+		Comment:            cleanText(extractText(desc, "rdfs:comment")),
+		CIMStereotype:      extractURIEnd(extractStereotype(desc)),
+		RDFDomain:          extractURIEnd(extractResource(desc, "rdfs:domain")),
+		CIMDataType:        extractURIEnd(extractResource(desc, "cims:dataType")),
+		RDFRange:           extractURIEnd(extractResource(desc, "rdfs:range")),
+		RDFType:            extractURIEnd(extractResource(desc, "rdf:type")),
 		CIMAssociationUsed: associationUsed,
 		IsAssociationUsed:  isAssociationUsed(associationUsed),
-		CIMInverseRole:     extractURIEnd(extractResource(classMap, "cims:inverseRoleName")),
-		CIMMultiplicity:    extractResource(classMap, "cims:multiplicity"),
-		IsList:             isListAttribute(extractResource(classMap, "cims:multiplicity")),
-		CIMIsFixed:         extractText(classMap, "cims:isFixed"),
+		CIMInverseRole:     extractURIEnd(extractResource(desc, "cims:inverseRoleName")),
+		CIMMultiplicity:    extractResource(desc, "cims:multiplicity"),
+		IsList:             isListAttribute(extractResource(desc, "cims:multiplicity")),
+		CIMIsFixed:         extractText(desc, "cims:isFixed"),
 	}
 }
 
@@ -473,39 +486,39 @@ func traverseAndExtractText(n *html.Node, builder *strings.Builder) {
 }
 
 // processEnum processes a map representing a CIM enumeration and returns a CIMEnum struct.
-func processEnum(classMap map[string]interface{}) CIMEnum {
+func processEnum(desc Description) CIMEnum {
 	return CIMEnum{
-		Id:            extractURIEnd(extractValue(classMap, "@rdf:about")),
-		Label:         extractText(classMap, "rdfs:label"),
-		Comment:       cleanText(extractText(classMap, "rdfs:comment")),
-		Namespace:     extractURIPath(extractValue(classMap, "@rdf:about")),
-		CIMStereotype: extractURIEnd(extractStringOrResource(classMap["cims:stereotype"])),
-		RDFType:       extractURIEnd(extractResource(classMap, "rdf:type")),
+		Id:            extractURIEnd(desc.About),
+		Label:         extractText(desc, "rdfs:label"),
+		Comment:       cleanText(extractText(desc, "rdfs:comment")),
+		Namespace:     extractURIPath(desc.About),
+		CIMStereotype: extractURIEnd(extractStereotype(desc)),
+		RDFType:       extractURIEnd(extractResource(desc, "rdf:type")),
 	}
 }
 
 // processEnumValue processes a map representing a CIM enumeration value and returns a CIMEnumValue struct.
-func processEnumValue(classMap map[string]interface{}) CIMEnumValue {
+func processEnumValue(desc Description) CIMEnumValue {
 	return CIMEnumValue{
-		Id:            extractURIEnd(extractValue(classMap, "@rdf:about")),
-		Label:         extractText(classMap, "rdfs:label"),
-		Comment:       cleanText(extractText(classMap, "rdfs:comment")),
-		CIMStereotype: extractURIEnd(extractStringOrResource(classMap["cims:stereotype"])),
-		RDFType:       extractURIEnd(extractResource(classMap, "rdf:type")),
+		Id:            extractURIEnd(desc.About),
+		Label:         extractText(desc, "rdfs:label"),
+		Comment:       cleanText(extractText(desc, "rdfs:comment")),
+		CIMStereotype: extractURIEnd(extractStereotype(desc)),
+		RDFType:       extractURIEnd(extractResource(desc, "rdf:type")),
 	}
 }
 
 // processOntology processes a map representing a CIM ontology and returns a CIMOntology struct.
-func processOntology(classMap map[string]interface{}) CIMOntology {
-	return CIMOntology{
-		Id:             extractURIEnd(extractValue(classMap, "@rdf:about")),
-		Namespace:      extractURIPath(extractValue(classMap, "@rdf:about")),
-		RDFType:        extractURIEnd(extractResource(classMap, "rdf:type")),
-		OWLVersionIRI:  extractResource(classMap, "owl:versionIRI"),
-		OWLVersionInfo: extractText(classMap, "owl:versionInfo"),
-		Keyword:        extractValue(classMap, "dcat:keyword"),
+func processOntology(desc Description) *CIMOntology {
+	return &CIMOntology{
+		Id:             extractURIEnd(desc.About),
+		Namespace:      extractURIPath(desc.About),
+		RDFType:        extractURIEnd(extractResource(desc, "rdf:type")),
+		OWLVersionIRI:  extractResource(desc, "owl:versionIRI"),
+		OWLVersionInfo: extractText(desc, "owl:versionInfo"),
+		Keyword:        desc.Keyword,
 		// remove suffix " Vocabulary" from name if present
-		Name: strings.TrimSuffix(extractText(classMap, "dcterms:title"), " Vocabulary"),
+		Name: strings.TrimSuffix(extractText(desc, "dcterms:title"), " Vocabulary"),
 	}
 }
 
@@ -655,50 +668,68 @@ func mergePrimitives(typesMerged map[string]*CIMPrimitive, types map[string]*CIM
 
 // extractResource extracts the resource URI from a map object using the specified key.
 // It returns an empty string if the key does not exist or the value is not a map.
-func extractResource(obj map[string]interface{}, key string) string {
-	if v, ok := obj[key]; ok {
-		if m, ok := v.(map[string]interface{}); ok {
-			return m["@rdf:resource"].(string)
-		}
+func extractResource(desc Description, key string) string {
+	var res *Resource
+	switch key {
+	case "rdf:type":
+		res = desc.Type
+	case "rdfs:subClassOf":
+		res = desc.SubClassOf
+	case "cims:belongsToCategory":
+		res = desc.BelongsToCategory
+	case "cims:dataType":
+		res = desc.DataType
+	case "rdfs:domain":
+		res = desc.Domain
+	case "rdfs:range":
+		res = desc.Range
+	case "cims:inverseRoleName":
+		res = desc.InverseRoleName
+	case "cims:multiplicity":
+		res = desc.Multiplicity
+	case "owl:versionIRI":
+		res = desc.VersionIRI
+	}
+	if res != nil {
+		return res.Resource
 	}
 	return ""
 }
 
-// extractStringOrResource extracts a string value or a resource URI from an interface{}.
-// It handles cases where the input is a string, a map with a resource, or a slice of maps.
-// It returns an empty string if no valid value is found.
-func extractStringOrResource(obj interface{}) string {
-	switch item := obj.(type) {
-	case string:
-		return item
-	case map[string]interface{}:
-		return item["@rdf:resource"].(string)
-	case []interface{}:
-		for _, m := range item {
-			if m, ok := m.(map[string]interface{}); ok {
-				return m["@rdf:resource"].(string)
-			}
+func extractStereotype(desc Description) string {
+	if desc.Stereotype != nil {
+		if desc.Stereotype.Resource != "" {
+			return desc.Stereotype.Resource
 		}
+		return desc.Stereotype.Text
 	}
 	return ""
 }
 
 // extractText extracts the text value from a map object using the specified key.
 // It returns an empty string if the key does not exist or the value is not a map.
-func extractText(obj map[string]interface{}, key string) string {
-	if v, ok := obj[key]; ok {
-		if m, ok := v.(map[string]interface{}); ok {
-			return m["_"].(string)
+func extractText(desc Description, key string) string {
+	switch key {
+	case "rdfs:label":
+		if desc.Label != nil {
+			return desc.Label.Text
 		}
-	}
-	return ""
-}
-
-// extractValue extracts a string value from a map object using the specified key.
-// It returns an empty string if the key does not exist.
-func extractValue(obj map[string]interface{}, key string) string {
-	if t, ok := obj[key]; ok {
-		return t.(string)
+	case "rdfs:comment":
+		if desc.Comment != nil {
+			return desc.Comment.Text
+		}
+	case "cims:isFixed":
+		if desc.IsFixed != nil {
+			return desc.IsFixed.Text
+		}
+	case "dcterms:title":
+		if desc.Title != nil {
+			return desc.Title.Text
+		}
+	case "owl:versionInfo":
+		if desc.VersionInfo != nil {
+			return desc.VersionInfo.Text
+		}
 	}
 	return ""
 }
